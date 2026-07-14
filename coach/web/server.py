@@ -984,24 +984,23 @@ async def api_sync(req: Request):
         _sync_running = True
         new_analyzed = 0
         try:
+            workers = max(1, int(os.environ.get(
+                "COACH_ANALYZE_WORKERS", (os.cpu_count() or 2) // 2)))
             analyze_cmd = [sys.executable, "-m", "coach.analyze",
-                           "--username", user, "--depth", str(depth)]
+                           "--username", user, "--depth", str(depth),
+                           "--workers", str(workers)]
             if deepen:
                 # Deepen existing games only — no fetch. Re-analyzes anything below `depth`.
-                # A deepen re-runs the whole corpus, so parallelise it across processes
-                # (the single-threaded multi-day pass was the pain point). Tunable via
-                # COACH_ANALYZE_WORKERS; default = half the cores, leaving UI headroom.
-                workers = max(1, int(os.environ.get(
-                    "COACH_ANALYZE_WORKERS", (os.cpu_count() or 2) // 2)))
                 phases = (
                     (f"Re-analyzing games below depth {depth} ({workers} workers)…",
-                     analyze_cmd + ["--deepen", "--workers", str(workers)]),
+                     analyze_cmd + ["--deepen"]),
                 )
             else:
                 phases = (
                     ("Fetching recent games…",
                      [sys.executable, "-m", "coach.fetch_games", user, "--months", "2"]),
-                    (f"Analyzing new games (depth {depth})…", analyze_cmd),
+                    (f"Analyzing new games (depth {depth}, {workers} workers)…",
+                     analyze_cmd),
                 )
             # Always refresh the before/after progress report after (re)analysis.
             phases = (*phases, ("Updating progress report…",

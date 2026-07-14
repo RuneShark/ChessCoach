@@ -350,6 +350,7 @@ def main(argv: list[str] | None = None) -> None:
         return _parallel(args, username)
 
     engine = chess.engine.SimpleEngine.popen_uci(find_stockfish())
+    engine.configure({"Hash": max(16, int(os.environ.get("COACH_ENGINE_HASH", "256")))})
     try:
         for game in iter_games():
             gid = game_id(game.headers)
