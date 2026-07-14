@@ -45,7 +45,7 @@ of mistakes over and over. Find those patterns, drill them out, and the rating f
 
 ## Install & run
 
-First get the code: `git clone <your-repo-url> chesscoach` (or download the ZIP from GitHub
+First get the code: `git clone https://github.com/RuneShark/ChessCoach.git chesscoach` (or download the ZIP from GitHub
 and unzip it), then follow your platform.
 
 ### Windows
