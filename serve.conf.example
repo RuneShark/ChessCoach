@@ -1,0 +1,4 @@
+# ChessCoach service config. Copy to `serve.conf` if you want to change the port.
+# Everything else — your Chess.com username and the AI-coach backend — is set from
+# the app's Settings panel and stored in config.json.
+COACH_PORT=6464

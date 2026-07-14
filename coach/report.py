@@ -1,0 +1,147 @@
+"""Aggregate per-game analysis into a recurring-mistake report.
+
+Reads every data/analysis/*.json and writes journal/report.md — the document
+the coach reads to decide what you drill next. The engine found the mistakes;
+this groups them so the *patterns* are visible instead of 200 isolated blips.
+
+Usage:
+    python -m coach.report
+"""
+from __future__ import annotations
+
+import json
+from collections import Counter, defaultdict
+from datetime import datetime
+
+from .paths import ANALYSIS_DIR, JOURNAL
+
+
+def load() -> list[dict]:
+    games = []
+    for f in sorted(ANALYSIS_DIR.glob("*.json")):
+        try:
+            games.append(json.loads(f.read_text()))
+        except json.JSONDecodeError:
+            print(f"  (skipping unreadable {f.name})")
+    return games
+
+
+def bar(n: int, total: int, width: int = 24) -> str:
+    if total == 0:
+        return ""
+    filled = round(width * n / total)
+    return "█" * filled + "·" * (width - filled)
+
+
+def build(games: list[dict]) -> str:
+    if not games:
+        return "# Report\n\nNo analyzed games yet. Run `python -m coach.analyze`.\n"
+
+    games.sort(key=lambda g: g.get("date", ""))
+    n = len(games)
+    outcomes = Counter(g["outcome"] for g in games)
+
+    all_mistakes = [m for g in games for m in g["mistakes"]]
+    by_sev = Counter(m["severity"] for m in all_mistakes)
+    by_phase = Counter(m["phase"] for m in all_mistakes)
+    blunders = [m for m in all_mistakes if m["severity"] == "blunder"]
+    hung = [m for m in blunders if m.get("hung_value", 0) >= 3]
+
+    # Accuracy trend: first vs second half (higher is better)
+    accs = [g.get("accuracy", 0) for g in games]
+    half = max(1, n // 2)
+    early = round(sum(accs[:half]) / half, 1)
+    late = round(sum(accs[half:]) / max(1, n - half), 1)
+
+    # phase where blunders concentrate, split by color
+    blunder_phase = Counter(m["phase"] for m in blunders)
+    color_split = Counter(m["color"] for m in blunders)
+
+    # openings that go wrong most (by blunders per game in that opening)
+    opening_trouble: dict[str, list[int]] = defaultdict(list)
+    for g in games:
+        op = g.get("opening") or g.get("eco") or "unknown"
+        opening_trouble[op].append(
+            sum(1 for m in g["mistakes"] if m["severity"] in ("mistake", "blunder"))
+        )
+
+    L = []
+    w = L.append
+    w(f"# Mistake Report — {datetime.now():%Y-%m-%d}")
+    w("")
+    w(f"**{n} games analyzed.**  "
+      f"Record: {outcomes.get('win',0)}W / {outcomes.get('loss',0)}L / {outcomes.get('draw',0)}D")
+    w("")
+    w(f"**Average accuracy:** {round(sum(accs)/n, 1)}%  "
+      f"— early games {early}% → recent games {late}% "
+      f"({'improving ↑' if late > early else 'not improving yet →'})")
+    w("*(Accuracy = how close to the engine you played, win%-based. "
+      "~1500 rapid is typically 75–85%.)*")
+    w("")
+
+    w("## Where the damage happens")
+    w("")
+    w("By severity:")
+    for sev in ("blunder", "mistake", "inaccuracy"):
+        c = by_sev.get(sev, 0)
+        w(f"- `{sev:11}` {c:4}  {bar(c, len(all_mistakes))}")
+    w("")
+    w("Blunders by game phase:")
+    for ph in ("opening", "middlegame", "endgame"):
+        c = blunder_phase.get(ph, 0)
+        w(f"- `{ph:11}` {c:4}  {bar(c, max(1, len(blunders)))}")
+    w("")
+    w(f"Blunders as **White** {color_split.get('white',0)} · "
+      f"as **Black** {color_split.get('black',0)}")
+    w("")
+
+    w("## Openings that turn sour")
+    w("*(mistakes+blunders per game in that opening; needs ≥2 games to count)*")
+    w("")
+    ranked = sorted(
+        ((op, sum(v)/len(v), len(v)) for op, v in opening_trouble.items() if len(v) >= 2),
+        key=lambda t: t[1], reverse=True,
+    )[:6]
+    if ranked:
+        for op, avg, cnt in ranked:
+            w(f"- **{op}** — {avg:.1f} serious errors/game across {cnt} games")
+    else:
+        w("- (not enough repeated openings yet — pull more games)")
+    w("")
+
+    w("## Worst moments (biggest blunders)")
+    w("*The coach should open these positions and turn each into a lesson.*")
+    w("")
+    top = sorted(blunders, key=lambda m: m.get("win_loss", 0), reverse=True)[:12]
+    for m in top:
+        tag = f" — hung ~{m['hung_value']} pts" if m.get("hung_value", 0) >= 3 else ""
+        best = f", best was {m['best']}" if m.get("best") else ""
+        swing = (f"{m.get('win_before','?')}%→{m.get('win_after','?')}% win")
+        w(f"- move {m['move_number']} ({m['color']}, {m['phase']}): "
+          f"played **{m['played']}** ({swing}{tag}){best}")
+        w(f"  - `{m['fen']}`")
+    w("")
+
+    if hung:
+        w(f"## Hung pieces: {len(hung)} of {len(blunders)} blunders "
+          f"were just leaving a piece en prise")
+        w("This is the single highest-leverage fix at this level — a pre-move "
+          "'is it defended / is it attacked' check. See the plan.")
+        w("")
+
+    w("---")
+    w("*Generated by `coach.report`. Coach: read this, then update "
+      "`journal/weaknesses.md` and `journal/plan.md`.*")
+    return "\n".join(L) + "\n"
+
+
+def main() -> None:
+    games = load()
+    report = build(games)
+    out = JOURNAL / "report.md"
+    out.write_text(report)
+    print(f"Wrote {out} ({len(games)} games).")
+
+
+if __name__ == "__main__":
+    main()

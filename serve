@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# ChessCoach web service control.
+#   ./serve start | stop | restart | status | logs
+#
+# Runs the FastAPI/uvicorn UI (coach.web) detached from any terminal, tracks it
+# by pidfile, and waits for it to answer before reporting "started". Port comes
+# from COACH_PORT (default 8000).
+set -uo pipefail
+cd "$(dirname "$0")" || exit 1
+
+# Port comes from serve.conf (optional); username + coach backend are set in the app's
+# Settings panel (config.json).
+[ -f ./serve.conf ] && . ./serve.conf
+export COACH_PORT="${COACH_PORT:-6464}"    # exported so `python -m coach.web` binds it
+# Use the project virtualenv if setup.sh created one, otherwise the system python.
+PYBIN="./.venv/bin/python3"; [ -x "$PYBIN" ] || PYBIN="python3"
+PORT="$COACH_PORT"
+PIDFILE=".web.pid"
+LOGFILE=".web.log"
+URL="http://127.0.0.1:${PORT}"
+
+running() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+
+start() {
+  if running; then echo "already running (pid $(cat "$PIDFILE")) → $URL"; return 0; fi
+  pkill -f "coach.web" 2>/dev/null && sleep 1     # clear any stray instance
+  setsid nohup "$PYBIN" -m coach.web >"$LOGFILE" 2>&1 &   # fully detached
+  echo $! > "$PIDFILE"
+  for _ in $(seq 1 20); do
+    curl -sf "$URL/api/status" >/dev/null 2>&1 && {
+      echo "started (pid $(cat "$PIDFILE")) → $URL"; return 0; }
+    running || { echo "failed to start — see ./serve logs"; return 1; }
+    sleep 0.5
+  done
+  echo "started but not answering yet — see ./serve logs"; return 1
+}
+
+stop() {
+  running && kill "$(cat "$PIDFILE")" 2>/dev/null
+  pkill -f "coach.web" 2>/dev/null
+  rm -f "$PIDFILE"
+  echo "stopped"
+}
+
+case "${1:-}" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) stop; sleep 1; start ;;
+  status)  if running; then echo "running (pid $(cat "$PIDFILE")) → $URL";
+           else echo "stopped"; fi ;;
+  logs)    tail -n 40 -f "$LOGFILE" ;;
+  *) echo "usage: ./serve {start|stop|restart|status|logs}"; exit 1 ;;
+esac

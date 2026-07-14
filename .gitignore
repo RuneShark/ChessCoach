@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime config — your username, backend choice, and API key. Never commit.
+config.json
+.env
+
+# Engine binary — install your own Stockfish (see the README).
+stockfish
+*.exe
+
+# Pulled / derived data — regenerable from your Chess.com account.
+data/games/*.pgn
+data/games/*.jsonl
+data/analysis/*.json
+data/drill_log.jsonl
+data/endgame_drills.json
+
+# Journal reports the pipeline generates per user (profile.md is the tracked template).
+journal/report.md
+journal/tilt.md
+journal/accuracy.md
+journal/endgame_conversion.md
+journal/progress.md
+journal/drill_progress.md
+journal/weaknesses.md
+journal/plan.md
+
+# Web service runtime
+.web.pid
+.web.log
+
+# Dev
+.playwright-mcp/

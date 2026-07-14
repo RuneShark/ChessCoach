@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChessCoach</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="/static/chess.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Chess<span>Coach</span></h1>
+    <div class="modes" id="modes">
+      <button data-mode="home" class="active">Home</button>
+      <button data-mode="analyze">Analyze</button>
+      <button data-mode="review">Review games</button>
+      <button data-mode="drill">Drill</button>
+      <button data-mode="play">Play engine</button>
+    </div>
+    <div class="status" id="status">connecting…</div>
+    <button id="open-settings" class="gear" title="Settings">⚙</button>
+  </header>
+
+  <!-- ===================== DASHBOARD (home) ===================== -->
+  <section id="home" class="dash">
+
+    <!-- first-run onboarding (shown until a username is set / games exist) -->
+    <div id="setup" class="setup" style="display:none">
+      <div class="card setup-card">
+        <div class="card-h">Welcome to ChessCoach 👋</div>
+        <p>Enter your Chess.com username to pull and analyze your games. It runs locally
+           and uses the public API — no password needed.</p>
+        <div class="setup-row">
+          <input id="setup-user" placeholder="Chess.com username" autocomplete="off" spellcheck="false"/>
+          <button id="setup-go">Fetch &amp; analyze my games</button>
+        </div>
+        <p class="hint">Then choose your AI coach in
+           <a href="#" id="setup-settings-link">Settings</a> — the Claude Code subscription,
+           an Anthropic API key, or a local Ollama model. The board, engine eval, review and
+           drills all work without any AI.</p>
+        <pre id="setup-log" class="synclog" style="display:none"></pre>
+      </div>
+    </div>
+
+    <div class="dash-grid">
+
+      <div class="card ratingcard">
+        <div class="card-h">Rating progression <span class="muted" id="rating-pool"></span></div>
+        <div class="progressbar" id="progressbar">
+          <div class="pb-fill" id="rating-fill"></div>
+          <div class="pb-peak" id="rating-peak"></div>
+          <div class="pb-cur" id="rating-cur"></div>
+        </div>
+        <div class="pb-scale"><span>1000</span><span>1500</span><span>2000 🎯</span></div>
+        <div class="ratingchart" id="ratingchart"></div>
+      </div>
+
+      <div class="card weekcard">
+        <div class="card-h">This week <span class="streak" id="streak-wrap">🔥 <b id="streak">0</b> day streak</span></div>
+        <div class="week" id="week"></div>
+        <div class="hint">A day is done at 5 drills.</div>
+      </div>
+
+      <div class="card reccard">
+        <div class="card-h">Recommended now</div>
+        <div id="rec"></div>
+      </div>
+
+      <div class="card traincard">
+        <div class="card-h">What the training is</div>
+        <ul class="bullets" id="training"></ul>
+      </div>
+
+      <div class="card gamescard">
+        <div class="card-h">Last 10 games <span class="muted">— click to review</span></div>
+        <div id="last10" class="last10"></div>
+      </div>
+
+      <div class="card chatcard">
+        <div class="card-h">Coach</div>
+        <div class="chatlog" id="dash-chatlog"></div>
+        <div class="chat-jump">
+          <button data-jump="analyze" title="Open the position you're discussing in Analyze">⚖ Analyze position</button>
+          <button data-jump="play" title="Play this position against the engine">♟ Play from here</button>
+          <button class="coach-sync" title="Board → coach sync mode">🔇 Sync: Silent</button>
+        </div>
+        <div class="chatinput">
+          <button class="chat-reset" title="Reset the coach session (if it gets stuck)">↻</button>
+          <textarea id="dash-chatbox" placeholder="Ask your coach… (Enter to send)"></textarea>
+          <button id="dash-send">Send</button>
+        </div>
+      </div>
+
+      <div class="card actioncard">
+        <div class="card-h">Update</div>
+        <div class="actions">
+          <button id="btn-sync" class="actbtn">🔄 Sync &amp; analyze new games</button>
+          <button id="btn-review" class="actbtn">🧠 Coach: review my progress</button>
+        </div>
+        <div class="syncrow">
+          <label class="depthsel">Depth
+            <select id="sync-depth">
+              <option>10</option><option selected>12</option><option>14</option>
+              <option>16</option><option>18</option><option>20</option><option>22</option>
+            </select>
+          </label>
+          <button id="btn-deepen" class="actbtn small" title="Re-run analysis on games below the chosen depth (never lowers a game already analyzed deeper)">⬇ Re-analyze deeper</button>
+          <span id="depth-cover" class="hint"></span>
+        </div>
+        <pre id="sync-log" class="synclog" style="display:none"></pre>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===================== BOARD (analyze/review/drill/play) ===================== -->
+  <main id="app-main" style="display:none">
+    <div class="left">
+      <div class="boardtools">
+        <button id="flip">⇅ Flip</button>
+        <button id="reset">↺ Reset</button>
+      </div>
+      <div class="turnbar white" id="turnbar">
+        <span class="dot"></span><span id="turntext">White to move</span>
+      </div>
+      <div class="boardwrap">
+        <div class="evalbar"><div class="evalfill" id="evalfill" style="height:50%"></div></div>
+        <div class="board" id="board"></div>
+        <svg id="annotations" viewBox="0 0 8 8" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="toolbar">
+        <button id="prev" class="navbtn">◀</button>
+        <button id="next" class="navbtn">▶</button>
+        <span class="evaltext" id="evaltext">eval —</span>
+      </div>
+    </div>
+
+    <div class="moves">
+      <div class="moves-h">Moves
+        <button id="explore-toggle" class="explore-btn" title="Explore variations without changing the game (only when reviewing a game)" disabled>🔀 Explore</button>
+      </div>
+      <div class="lines" id="lines" style="display:none"></div>
+      <div class="movelist" id="movelist"></div>
+    </div>
+
+    <div class="right">
+      <div class="tabhead" id="tabhead">
+        <button data-tab="chat" class="active">Coach</button>
+        <button data-tab="games">Games</button>
+        <button data-tab="drill">Drill</button>
+      </div>
+      <div class="tabbody">
+        <div class="tab active" id="tab-chat">
+          <div class="chatlog" id="chatlog"></div>
+        </div>
+        <div class="tab" id="tab-games">
+          <div class="hint" id="games-hint">Loading your analyzed games…</div>
+          <div id="games-list"></div>
+        </div>
+        <div class="tab" id="tab-drill">
+          <div id="drill-body">
+            <p class="hint">Blunder drill — a real position where you threw a game you
+            weren't losing. The orange arrow shows what you played; find a better move
+            (drag or click). It's graded live; wrong moves you can retry. Right-click to
+            draw your own arrows / mark squares.</p>
+            <div id="drill-stats" class="drill-stats"></div>
+            <label class="hint" style="display:inline-flex;align-items:center;gap:6px;margin-right:10px">
+              Type
+              <select id="drill-mode">
+                <option value="standard">Blunder-check (opening/middlegame)</option>
+                <option value="endgame">Endgame conversion (winning endings)</option>
+              </select>
+            </label>
+            <button id="drill-new">New position</button>
+            <div id="drill-info" style="margin-top:12px"></div>
+          </div>
+        </div>
+      </div>
+      <div class="chat-jump">
+        <button data-jump="analyze" title="Open the current position in Analyze">⚖ Analyze position</button>
+        <button data-jump="play" title="Play this position against the engine">♟ Play from here</button>
+        <button class="coach-idea" title="Ask the coach about the current board position">💡 What's the idea?</button>
+        <button class="coach-sync" title="Board → coach sync mode">🔇 Sync: Silent</button>
+      </div>
+      <div class="chatinput" id="chatinput">
+        <button class="chat-reset" title="Reset the coach session (if it gets stuck)">↻</button>
+        <textarea id="chatbox" placeholder="Ask your coach anything… (Enter to send)"></textarea>
+        <button id="send">Send</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ===================== SETTINGS MODAL ===================== -->
+  <div id="settings-modal" class="modal" style="display:none">
+    <div class="modal-box">
+      <div class="modal-h">Settings <button id="settings-close" class="modal-x" title="Close">×</button></div>
+
+      <label class="fld">Chess.com username
+        <input id="cfg-user" autocomplete="off" spellcheck="false" placeholder="your username"/></label>
+
+      <label class="fld">AI coach backend
+        <select id="cfg-backend">
+          <option value="">Auto (Claude CLI if present, else API key)</option>
+          <option value="subscription">Claude Code subscription (CLI)</option>
+          <option value="api">Anthropic API (key)</option>
+          <option value="local">Local Ollama model</option>
+        </select></label>
+
+      <div id="cfg-sub" class="cfg-group hint">
+        Uses the <code>claude</code> CLI — it must be installed and logged in.
+        <span id="cfg-cli-status"></span>
+      </div>
+      <div id="cfg-api" class="cfg-group">
+        <label class="fld">Anthropic API key
+          <input id="cfg-key" type="password" placeholder="sk-ant-…"/></label>
+        <label class="fld">Model
+          <input id="cfg-model-api" placeholder="claude-sonnet-5"/></label>
+      </div>
+      <div id="cfg-local" class="cfg-group">
+        <label class="fld">Ollama URL
+          <input id="cfg-url" placeholder="http://localhost:11434"/></label>
+        <label class="fld">Model
+          <input id="cfg-model-local" placeholder="llama3.1"/></label>
+        <label class="fld chk"><input id="cfg-think" type="checkbox"/> Thinking mode (slower)</label>
+      </div>
+
+      <div class="modal-foot">
+        <span id="cfg-status" class="hint"></span>
+        <button id="cfg-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
