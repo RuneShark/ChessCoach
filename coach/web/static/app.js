@@ -3,6 +3,8 @@
 const GLYPH = { k:"♚", q:"♛", r:"♜", b:"♝", n:"♞", p:"♟" };
 const $ = (s) => document.querySelector(s);
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+const CHAT_MAX = 1000;       // max chat entries we keep/persist (project-side + in memory)
+const CHAT_SEND_MAX = 16;    // only the last N messages go to the model (tight context, no drift)
 
 const S = {
   game: new Chess(),
@@ -782,10 +784,39 @@ function normalizeFen(raw) {
   if (rows.length < 8) rows = rows.concat(Array(8 - rows.length).fill("8"));  // pad empty ranks
   if (rows.length > 8) rows = rows.slice(0, 8);
   placement = rows.join("/");
+  // Small models routinely emit ILLEGAL placements (verified: a "Lucena" with two white kings
+  // and no black king). chess.js v0.x .load() accepts those and the board jumps to garbage, so
+  // reject anything without exactly one king per side here — the caller then leaves the board
+  // untouched and tells the student, instead of silently corrupting the position.
+  if ((placement.match(/K/g) || []).length !== 1 ||
+      (placement.match(/k/g) || []).length !== 1) return null;
   parts[0] = placement;
   const defaults = ["w", "-", "-", "0", "1"];   // side, castling, en-passant, halfmove, fullmove
   for (let i = 1; i <= 5; i++) if (!parts[i]) parts[i] = defaults[i - 1];
   return parts.slice(0, 6).join(" ");
+}
+
+// Canonical positions the coach asks for by NAME. A small local model botches the FEN or (worse)
+// tries to reach an ENDGAME via opening [[moves]] — so when the reply names one of these, we
+// resolve the name to the exact FEN ourselves and set it up authoritatively.
+const KNOWN_POSITIONS = [
+  { re: /\blucena\b/i,               fen: "1K1k4/1P6/8/8/8/8/r7/2R5 w - - 0 1" },
+  { re: /\bphilidor\b/i,             fen: "8/8/8/8/4pk2/8/4RK2/6r1 w - - 0 1" },
+  { re: /\bopposition\b/i,           fen: "8/8/4k3/8/4P3/4K3/8/8 w - - 0 1" },
+  { re: /\b(k(ing)?\s*\+?\s*q(ueen)?|dame).*(mate|matt)|q\s*vs\s*k/i,
+                                     fen: "8/8/8/4k3/8/8/8/3QK3 w - - 0 1" },
+  { re: /\b(k(ing)?\s*\+?\s*r(ook)?|turm).*(mate|matt)|r\s*vs\s*k/i,
+                                     fen: "8/8/8/4k3/8/8/8/R3K3 w - - 0 1" },
+];
+// If the coach NAMED a canonical position but its own board-setup directive would fail/mislead,
+// swap in the exact FEN (and drop the bad moves/fen). Returns possibly-rewritten directives.
+function resolveNamedPosition(clean, directives) {
+  const kp = KNOWN_POSITIONS.find((k) => k.re.test(clean || ""));
+  if (!kp) return directives;
+  const wantsSetup = directives.some((d) => /^(moves?|fen|reset)$/.test(d.type));
+  if (!wantsSetup) return directives;
+  return [{ type: "fen", arg: kp.fen },
+          ...directives.filter((d) => !/^(moves?|fen|reset)$/.test(d.type))];
 }
 
 function parseDirectives(text) {
@@ -823,13 +854,15 @@ function applyCoachBoard(directives, annotationsOnly) {
     directives = directives.filter((d) => d.type !== "moves" && d.type !== "move");
   }
   let touched = false, jump = null, lastMv = null, playSide = null, orientSet = false,
-      annotated = false;
+      annotated = false, fenFailed = false, movesFailed = false;
   for (const d of directives) {
     if (d.type === "fen") {
       const fen = normalizeFen(d.arg);
       if (fen && S.game.load(fen)) {
         touched = true; lastMv = null; S.baseFen = fen;
         S.arrows = []; S.hlSquares = [];       // a fresh position drops stale annotations
+      } else {
+        fenFailed = true;   // bad/illegal FEN — warn once after the loop
       }
     } else if (d.type === "reset") {
       S.game.reset(); touched = true; lastMv = null; S.baseFen = null;
@@ -860,6 +893,7 @@ function applyCoachBoard(directives, annotationsOnly) {
         }
       }
       if (r.n) { touched = true; lastMv = r.last; }
+      else if (toks.length) { movesFailed = true; }   // none legal here — warn once after the loop
     } else if (d.type === "orient") {
       S.orient = /^b/i.test(d.arg) ? "black" : "white"; touched = true; orientSet = true;
     } else if (d.type === "flip") {
@@ -882,6 +916,10 @@ function applyCoachBoard(directives, annotationsOnly) {
       S.arrows = []; S.hlSquares = []; annotated = true;
     }
   }
+  // One consolidated warning per reply (a small model may spam several bad directives).
+  if (fenFailed) addChat("sys", "⚠ Coach sent an invalid position — board left unchanged.");
+  if (movesFailed && !touched)
+    addChat("sys", "⚠ Coach’s move(s) didn’t fit this position — board unchanged.");
   if (!touched && !jump) {          // annotation-only: draw it, leave the board/mode alone
     if (annotated) { renderAnnotations(); return true; }
     return false;
@@ -985,7 +1023,15 @@ function scrollChatToBottom() {
   });
 }
 function saveChat() {
-  try { localStorage.setItem("cc_chat", JSON.stringify(S.chat.slice(-40))); } catch (e) {}
+  if (S.chat.length > CHAT_MAX) S.chat = S.chat.slice(-CHAT_MAX);   // cap in memory
+  try { localStorage.setItem("cc_chat", JSON.stringify(S.chat.slice(-100))); } catch (e) {}
+  // Persist to the project (server file, capped at 1000). Debounced so a burst of addChat()
+  // calls in one turn collapses to a single write.
+  clearTimeout(S.chatSaveTimer);
+  S.chatSaveTimer = setTimeout(() => {
+    fetch("/api/chat/history", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: S.chat }) }).catch(() => {});
+  }, 500);
 }
 /* Generic SSE reader shared by chat / coach-review / sync. Calls onEvent(obj). */
 async function streamSSE(url, body, onEvent) {
@@ -1027,9 +1073,9 @@ function coachBoardInfo() {
 /* ----- board → coach sync (3-state toggle: live / silent / off) ----- */
 const SYNC_ORDER = ["silent", "live", "off"];
 const SYNC_UI = {
-  live:   { label: "🔄 Sync: Live",   title: "Coach auto-comments on every board change" },
-  silent: { label: "🔇 Sync: Silent", title: "Coach silently tracks the board; speaks only when asked" },
-  off:    { label: "⏸ Sync: Off",     title: "Coach is not sent the board unless you click a board button" },
+  live:   { label: "🔄 Sync: Live",   title: "Coach sees the board AND auto-comments on every change" },
+  silent: { label: "👁 Sync: Silent", title: "Coach sees the current board on every message; comments only when you ask" },
+  off:    { label: "🚫 Sync: Off",    title: "Coach does NOT see the board (only when you click a board button like “What’s the idea?”)" },
 };
 function loadSync() {
   const v = localStorage.getItem("cc_sync");
@@ -1060,8 +1106,11 @@ function notifyCoachBoard() {
     else if (S.coachSync === "silent") silentSyncBoard();
   }, 800);
 }
-// Silently tell the warm coach session about the current position (no visible reply).
+// Silently tell the warm coach session about the current position (no visible reply). Only the
+// SUBSCRIPTION backend has a frozen system prompt that needs priming — for local/API the board
+// rides fresh with every /api/chat call, so this would be a pure no-op. Skip it there.
 async function silentSyncBoard() {
+  if (S.backend !== "subscription") return;
   try {
     await fetch("/api/coach/board", { method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1082,7 +1131,10 @@ async function sendChat(text, fenOverride, boardInfo) {
   text = (text || "").trim();
   if (!text) return;
   addChat("user", text);
+  // Only the last CHAT_SEND_MAX turns go to the model — the full history persists, but a long
+  // one both bloats context and makes a small model anchor on stale board talk.
   const msgs = S.chat.filter((m) => m.role === "user" || m.role === "coach")
+    .slice(-CHAT_SEND_MAX)
     .map((m) => ({ role: m.role === "coach" ? "assistant" : "user", content: m.content }));
   addChat("coach", "");
   const idx = S.chat.length - 1; let acc = "";
@@ -1092,10 +1144,12 @@ async function sendChat(text, fenOverride, boardInfo) {
   //    live-sync) — always carries the full live board (fen + moves + game).
   //  - fenOverride: a drill's bare position (no move history).
   //  - a plain typed message: carries the live board UNLESS the sync toggle is Off.
-  const body = boardInfo ? { messages: msgs, ...boardInfo }
-             : fenOverride ? { messages: msgs, fen: fenOverride }
-             : S.coachSync === "off" ? { messages: msgs }
-             : { messages: msgs, ...coachBoardInfo() };
+  let body;
+  if (boardInfo)                  body = { messages: msgs, ...boardInfo };        // "explain THIS"
+  else if (fenOverride)           body = { messages: msgs, fen: fenOverride };    // drill position
+  else if (!boardMode())          body = { messages: msgs, no_board: true };      // dashboard: meta/history — no board the user is looking at
+  else if (S.coachSync === "off") body = { messages: msgs };                      // board hidden by user choice
+  else                            body = { messages: msgs, ...coachBoardInfo() }; // live board rides along
   const suppressDrive = !!fenOverride || !!boardInfo;   // "explain this" asks don't drive the board
   try {
     await streamSSE("/api/chat", body, (j) => {
@@ -1110,7 +1164,10 @@ async function sendChat(text, fenOverride, boardInfo) {
   // "Explain this position" asks (drill idea, live idea, live-sync) are questions ABOUT the
   // shown position — the reply may still DRAW on it (arrows/highlights) but not drive/replace
   // it (annotationsOnly = suppressDrive). Plain chat can do both.
-  if (directives.length && applyCoachBoard(directives, suppressDrive)) {
+  // First: if the coach named a canonical position (Lucena/Philidor/…) but botched the setup
+  // directive, swap in the exact FEN so the right board actually appears.
+  const dirs = suppressDrive ? directives : resolveNamedPosition(clean, directives);
+  if (dirs.length && applyCoachBoard(dirs, suppressDrive)) {
     const where = ({ analyze: "Analyze", play: "Play vs engine" })[S.mode];
     addChat("sys", suppressDrive ? "↪ Coach drew on the board."
       : "↪ Coach updated the board" + (where ? ` — you're now in ${where}.` : "."));
@@ -1443,6 +1500,8 @@ const LOCAL_BACKENDS_JS = ["local", "ollama", "qwen", "gemma"];
 async function refreshStatus() {
   try {
     const s = await (await fetch("/api/status")).json();
+    S.backend = s.backend || null;      // "none" | "local" | "subscription" | "api"
+    renderSyncToggle();
     $("#status").textContent = `${s.analyzed} games` + (s.coach ? ` · coach: ${s.backend}` : " · coach: off");
     const setup = $("#setup"), grid = document.querySelector("#home .dash-grid");
     if (setup) setup.style.display = s.configured ? "none" : "block";
@@ -1520,8 +1579,16 @@ async function saveConfig() {
 
 async function boot() {
   wire(); restoreBoard(); renderBoard(); renderMoveList();
-  try { const saved = localStorage.getItem("cc_chat"); if (saved) S.chat = JSON.parse(saved) || []; } catch (e) {}
-  if (S.chat.length) renderChat();     // restore the conversation across sessions
+  // Restore chat: prefer the project-persisted history (survives across machines/browsers),
+  // fall back to localStorage.
+  try {
+    const h = await (await fetch("/api/chat/history")).json();
+    if (h && Array.isArray(h.messages) && h.messages.length) S.chat = h.messages;
+  } catch (e) {}
+  if (!S.chat.length) {
+    try { const saved = localStorage.getItem("cc_chat"); if (saved) S.chat = JSON.parse(saved) || []; } catch (e) {}
+  }
+  if (S.chat.length) { renderChat(); saveChat(); }   // restore + sync to the project store
   else addChat("coach", "Hi — I'm your chess coach. Load a game to review, hit Drill to " +
     "train on your own blunder positions, or just ask me anything. I read your game analysis " +
     "and can set up positions, spar with you, and draw on the board.");

@@ -28,7 +28,7 @@ import chess
 import chess.engine
 import chess.pgn
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..analyze import INACCURACY, find_stockfish, game_id, guess_username, win_pct
@@ -38,6 +38,8 @@ STATIC = Path(__file__).parent / "static"
 MATE = 100_000
 DRILL_LOG = DATA / "drill_log.jsonl"  # append-only record of every drill attempt
 ENDGAME_DRILLS = DATA / "endgame_drills.json"  # winning-endgame conversion drill pool
+CHAT_HISTORY = DATA / "chat_history.json"  # persisted coach chat, capped at CHAT_HISTORY_MAX
+CHAT_HISTORY_MAX = 1000                     # keep at most the last N chat entries (messages)
 
 
 def _load_dotenv() -> None:
@@ -448,6 +450,38 @@ def _format_moves(moves) -> str:
     return " ".join(out)
 
 
+def _board_render(fen: str) -> str | None:
+    """Render a FEN as an explicit board the model does NOT have to decode itself: an
+    8x8 ASCII grid (rank 8 down to 1, with file labels) plus a per-colour piece list
+    (piece + square). A small local LLM reads raw FEN unreliably — it gets simple lookups
+    but misreports occupancy on denser positions — so we hand it the decoded board."""
+    try:
+        b = chess.Board(fen)
+    except Exception:  # noqa: BLE001
+        return None
+    rows = []
+    for rank in range(7, -1, -1):
+        cells = []
+        for file in range(8):
+            p = b.piece_at(chess.square(file, rank))
+            cells.append(p.symbol() if p else ".")
+        rows.append(f"{rank + 1}  " + " ".join(cells))
+    grid = "\n".join(rows) + "\n   a b c d e f g h"
+    white, black = [], []
+    for sq in chess.SQUARES:
+        p = b.piece_at(sq)
+        if not p:
+            continue
+        (white if p.color else black).append(p.symbol() + chess.square_name(sq))
+    order = {"K": 0, "Q": 1, "R": 2, "B": 3, "N": 4, "P": 5}
+    keyf = lambda s: (order.get(s[0].upper(), 9), s[1:])
+    turn = "White" if b.turn else "Black"
+    return (f"Board (uppercase = White, lowercase = Black, '.' = empty):\n{grid}\n"
+            f"White pieces: {', '.join(sorted(white, key=keyf))}\n"
+            f"Black pieces: {', '.join(sorted(black, key=keyf))}\n"
+            f"{turn} to move.")
+
+
 def _board_context(fen=None, moves=None, ply=None, game=None) -> str:
     """A human-readable snapshot of what's on the board: the loaded game (if any), the
     moves that led here, where the cursor is, and the current FEN. Empty if nothing given."""
@@ -469,11 +503,14 @@ def _board_context(fen=None, moves=None, ply=None, game=None) -> str:
             lines.append(f"The student is currently viewing the position after "
                          f"{ply} half-move(s) (i.e. just after {seen}), NOT the final move.")
     if fen:
-        lines.append(f"Current position on the board (FEN): {fen}")
+        rendered = _board_render(fen)
+        if rendered:
+            lines.append(rendered)
+        lines.append(f"FEN: {fen}")
     return "\n".join(lines)
 
 
-def coach_system(fen: str | None, moves=None, ply=None, game=None) -> str:
+def coach_system(fen: str | None, moves=None, ply=None, game=None, no_board=False) -> str:
     parts = [COACH_PERSONA]
     for name, cap in (("profile.md", 2000), ("weaknesses.md", 3500),
                       ("plan.md", 3000), ("tilt.md", 2500), ("report.md", 2500)):
@@ -489,6 +526,11 @@ def coach_system(fen: str | None, moves=None, ply=None, game=None) -> str:
     if ctx:
         parts.append("\n\n===== CURRENT BOARD =====\n" + ctx +
                      "\nWhen relevant, talk about THIS position and these moves.")
+    elif no_board:
+        parts.append("\n\n===== CURRENT BOARD =====\nNo board is loaded — the student is on the "
+                     "dashboard asking a history/meta question. Do NOT invent or describe a "
+                     "specific position. If they want to see or set up a position, emit a board "
+                     "directive (e.g. [[fen: …]] or [[moves: …]]) — it opens the board for them.")
     return "".join(parts)
 
 
@@ -621,13 +663,17 @@ async def _stream_via_session(text: str):
                 return                               # turn done; process stays warm
 
 
-def _coach_sse(*, fen=None, moves=None, ply=None, game=None, prompt=None, messages=None):
+def _coach_sse(*, fen=None, moves=None, ply=None, game=None, prompt=None, messages=None,
+               no_board=False):
     """SSE generator streaming a coach reply from whichever backend is configured."""
     backend = _backend()
     text = prompt if prompt is not None else ((messages or [{}])[-1].get("content", ""))
     ctx = _board_context(fen, moves, ply, game)
     if ctx:                                          # the warm session carries context inline
         text = f"[BOARD CONTEXT]\n{ctx}\n\n{text}"
+    elif no_board:
+        text = ("[BOARD CONTEXT]\nNo board is loaded (dashboard / history question). "
+                "Do not invent a position.\n\n" + text)
 
     async def gen():
         if backend == "none":
@@ -635,14 +681,27 @@ def _coach_sse(*, fen=None, moves=None, ply=None, game=None, prompt=None, messag
             yield "data: [DONE]\n\n"
             return
         try:
-            msgs = messages if messages is not None else [
+            base_msgs = messages if messages is not None else [
                 {"role": "user", "content": prompt or ""}]
+            # Put the CURRENT board on the last user message too (not only the system prompt): a
+            # small local model otherwise anchors on stale board talk earlier in the chat — e.g.
+            # keeps discussing the Italian after you've set up a Lucena.
+            msgs = base_msgs
+            if (ctx or no_board) and base_msgs:
+                pre = (f"[CURRENT BOARD]\n{ctx}\n\n" if ctx else
+                       "[CURRENT BOARD]\nNo board is loaded (dashboard / history question). "
+                       "Do not invent a position.\n\n")
+                msgs = [dict(x) for x in base_msgs]
+                for i in range(len(msgs) - 1, -1, -1):
+                    if msgs[i].get("role") == "user":
+                        msgs[i]["content"] = pre + msgs[i].get("content", "")
+                        break
             if backend == "local":
-                src = _stream_via_ollama(coach_system(fen, moves, ply, game), msgs)
+                src = _stream_via_ollama(coach_system(fen, moves, ply, game, no_board=no_board), msgs)
             elif backend == "subscription":
                 src = _stream_via_session(text)
             else:                                    # api
-                src = _stream_via_api(coach_system(fen, moves, ply, game), msgs)
+                src = _stream_via_api(coach_system(fen, moves, ply, game, no_board=no_board), msgs)
             async for t in src:
                 yield f"data: {json.dumps({'t': t})}\n\n"
         except Exception as e:  # noqa: BLE001
@@ -657,7 +716,7 @@ async def api_chat(req: Request):
     body = await req.json()
     gen = _coach_sse(fen=body.get("fen"), moves=body.get("moves"),
                      ply=body.get("ply"), game=body.get("game"),
-                     messages=body.get("messages", []))
+                     messages=body.get("messages", []), no_board=body.get("no_board", False))
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
@@ -707,7 +766,50 @@ async def api_coach_reset():
             p.kill()
         except Exception:  # noqa: BLE001
             pass
+    with _chat_lock:                     # a reset also wipes the persisted history
+        _write_chat([])
     return {"ok": True}
+
+
+# ---- persisted coach chat (project-side, capped) -------------------------------------------
+_chat_lock = threading.Lock()
+
+
+def _read_chat() -> list:
+    if not CHAT_HISTORY.exists():
+        return []
+    try:
+        data = json.loads(CHAT_HISTORY.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _write_chat(messages: list) -> list:
+    """Keep only the last CHAT_HISTORY_MAX well-formed entries; write atomically."""
+    clean = [m for m in messages
+             if isinstance(m, dict) and m.get("role") and "content" in m][-CHAT_HISTORY_MAX:]
+    CHAT_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CHAT_HISTORY.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(clean, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(CHAT_HISTORY)
+    return clean
+
+
+@app.get("/api/chat/history")
+def api_chat_history_get():
+    return {"messages": _read_chat(), "max": CHAT_HISTORY_MAX}
+
+
+@app.post("/api/chat/history")
+async def api_chat_history_post(req: Request):
+    try:
+        body = await req.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False}, status_code=400)
+    with _chat_lock:
+        saved = _write_chat(body.get("messages") or [])
+    return {"ok": True, "count": len(saved), "max": CHAT_HISTORY_MAX}
 
 # -------------------------------------------------------------------------- dashboard
 INDEX_FILE = GAMES_DIR / "index.jsonl"
@@ -1226,12 +1328,29 @@ async def api_move(req: Request):
                             float(body.get("movetime", 0.3)))
 
 
+def _cache_bust(html: str) -> str:
+    # StaticFiles serves app.js/style.css/chess.min.js with an etag but no max-age, so a
+    # browser applies HEURISTIC caching and can serve a STALE app.js without revalidating —
+    # which looks like "my changes / the coach's board-driving just do nothing". index.html
+    # itself is no-cache (always revalidated), so stamping each /static/<asset> reference with
+    # its file mtime gives a fresh URL whenever the asset changes → guaranteed fresh load.
+    def stamp(m):
+        name = m.group(1)
+        try:
+            v = int((STATIC / name).stat().st_mtime)
+        except OSError:
+            return m.group(0)
+        return f'/static/{name}?v={v}'
+    return re.sub(r'/static/(app\.js|style\.css|chess\.min\.js)', stamp, html)
+
+
 @app.get("/")
 def index():
     # No-cache so a freshly-deployed app.js never pairs with a browser-cached index.html
-    # (that mismatch throws in wire() when new markup is missing).
-    return FileResponse(str(STATIC / "index.html"),
-                        headers={"Cache-Control": "no-cache, must-revalidate"})
+    # (that mismatch throws in wire() when new markup is missing). Also version-stamp the
+    # static asset URLs so an updated app.js/css can't be served stale from cache.
+    html = _cache_bust((STATIC / "index.html").read_text(encoding="utf-8"))
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
 @app.get("/favicon.ico")

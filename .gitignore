@@ -17,6 +17,7 @@ data/games/*.jsonl
 data/analysis/*.json
 data/drill_log.jsonl
 data/endgame_drills.json
+data/chat_history.json
 
 # Journal reports the pipeline generates per user (profile.md is the tracked template).
 journal/report.md
