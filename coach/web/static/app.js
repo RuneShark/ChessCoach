@@ -26,6 +26,7 @@ const S = {
   chat: [],             // [{role, content}]
   coachSync: "silent",  // board→coach sync: "live" (auto-comment) | "silent" | "off"
   syncTimer: null,      // debounce for board-change sync
+  syncAttached: false,  // already watching the server's analysis job (don't double-attach)
   drag: null,           // active drag-and-drop state
   suppressClick: false, // swallow the click that trails a drag
   arrows: [],           // [{from,to,color}] right-click arrows; coach arrows carry {hex,opacity}
@@ -1033,11 +1034,19 @@ function saveChat() {
       body: JSON.stringify({ messages: S.chat }) }).catch(() => {});
   }, 500);
 }
-/* Generic SSE reader shared by chat / coach-review / sync. Calls onEvent(obj). */
+/* Generic SSE reader shared by chat / coach-review / sync. Calls onEvent(obj).
+   Pass body === null to GET instead of POST. */
 async function streamSSE(url, body, onEvent) {
-  const r = await fetch(url, { method: "POST",
+  const r = await fetch(url, body === null ? { method: "GET" } : { method: "POST",
     headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  if (r.status === 409) { onEvent({ error: "A sync is already running." }); return; }
+  // Nothing streams on an error status — the body is JSON, and reading it as SSE would
+  // just fail silently and look like an empty response.
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    onEvent({ error: j.error === "no_job" ? "That job is no longer available."
+                                          : (j.error || `server said ${r.status}`) });
+    return;
+  }
   const reader = r.body.getReader(); const dec = new TextDecoder();
   let buf = "";
   while (true) {
@@ -1312,19 +1321,44 @@ function renderLast10(list) {
     else row.classList.add("noana");
   });
 }
+/* The sync runs on the server, not in this page: starting it and watching it are separate
+   steps, so a reload just re-attaches to the job instead of losing (or duplicating) it. */
+function syncButtons(disabled) {
+  [$("#btn-sync"), $("#btn-deepen")].forEach((b) => b && (b.disabled = disabled));
+}
 async function startSync(deepen) {
-  const log = $("#sync-log");
-  const buttons = [$("#btn-sync"), $("#btn-deepen")];
   const depth = parseInt(($("#sync-depth") || {}).value, 10) || 12;
-  buttons.forEach((b) => b && (b.disabled = true));
-  log.style.display = "block"; log.textContent = "";
+  syncButtons(true);
+  const r = await fetch("/api/sync", { method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ depth, deepen: !!deepen }) });
+  // 409 = one is already going (another tab, or a click that beat us here) — watch that
+  // one rather than reporting an error; either way the outcome is "a sync is running".
+  if (!r.ok && r.status !== 409) {
+    const j = await r.json().catch(() => ({}));
+    const log = $("#sync-log");
+    log.style.display = "block";
+    log.textContent = "⚠ " + (j.error === "no_username"
+      ? "No Chess.com username set — add one in Settings." : (j.error || r.status));
+    syncButtons(false);
+    return;
+  }
+  attachSync();
+}
+/* Follow the running job. Safe to call on load, on returning Home, and after starting. */
+async function attachSync() {
+  if (S.syncAttached) return;
+  S.syncAttached = true;
+  const log = $("#sync-log");
+  log.style.display = "block"; log.textContent = "";      // the stream replays from the top
+  syncButtons(true);
   const put = (t) => { log.textContent += t + "\n"; log.scrollTop = 1e9; };
   try {
-    await streamSSE("/api/sync", { depth, deepen: !!deepen }, (j) => {
+    await streamSSE("/api/sync/stream", null, (j) => {
       if (j.t) put(j.t);
       if (j.error) put("⚠ " + j.error);
       if (j.done) {
-        const verb = deepen ? "deepened" : "new game(s) analyzed";
+        const verb = j.done.deepen ? "deepened" : "new game(s) analyzed";
         put(`\n✔ ${j.done.new_analyzed} ${verb}. ` +
             `Total ${j.done.games_total}. Rating ${j.done.current_rating}.`);
         S.lastSyncNew = j.done.new_analyzed;
@@ -1332,7 +1366,15 @@ async function startSync(deepen) {
       }
     });
   } catch (e) { put("⚠ " + e.message); }
-  buttons.forEach((b) => b && (b.disabled = false));
+  S.syncAttached = false;
+  syncButtons(false);
+}
+/* On load: if a sync is mid-flight (or just finished), show it instead of a dead log. */
+async function resumeSync() {
+  try {
+    const s = await (await fetch("/api/sync/status")).json();
+    if (s.running || (s.finished_ago != null && s.finished_ago < 120)) attachSync();
+  } catch (e) {}
 }
 // Analysis-depth coverage line under the sync buttons.
 function renderDepthCoverage(depth) {
@@ -1593,6 +1635,7 @@ async function boot() {
     "train on your own blunder positions, or just ask me anything. I read your game analysis " +
     "and can set up positions, spar with you, and draw on the board.");
   setMode("home");                    // land on the dashboard
+  resumeSync();                       // a sync from before the reload is still running
   refreshStatus();                    // status line + first-run onboarding toggle
 }
 boot();

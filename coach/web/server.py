@@ -1063,14 +1063,109 @@ def _progress_prompt(new_analyzed=None) -> str:
 
 
 # ----------------------------------------------------------------------------- sync
-_sync_running = False
+# A sync spawns subprocesses that run for minutes, so the job is deliberately NOT tied to
+# the request that starts it. It lives here and /api/sync/stream is only a viewer: it can
+# attach, die on a reload, and re-attach to the same job with the log replayed. Running it
+# off the request also means a disconnect can no longer orphan a live analyzer while the
+# server forgets it was ever busy — which used to let a second one race it over the files.
+_SYNC_LOG_CAP = 400     # keep the tail: a deep re-analysis prints a line per game
+_SYNC_KEEP = 120        # seconds a finished job stays attachable, so a reload at the
+                        # finish line still gets to see the result
+_sync_job: dict | None = None
+
+
+def _sync_emit(job: dict, ev: dict) -> None:
+    """Append one event to the job's log and wake everyone attached to it."""
+    job["log"].append(ev)
+    if len(job["log"]) > _SYNC_LOG_CAP:
+        drop = len(job["log"]) - _SYNC_LOG_CAP
+        del job["log"][:drop]
+        job["base"] += drop        # viewers index the log absolutely, so track the cut
+    wake, job["wake"] = job["wake"], asyncio.Event()
+    wake.set()
+
+
+def _sync_state(job: dict | None) -> dict:
+    if not job:
+        return {"running": False}
+    return {"running": job["running"], "id": job["id"],
+            "depth": job["depth"], "deepen": job["deepen"],
+            "started": job["started"],
+            "finished_ago": None if job["running"] else time.time() - job["finished"]}
+
+
+async def _sync_run(job: dict, user: str) -> None:
+    """The job itself. Owns its subprocesses and always releases the busy flag."""
+    global _pgn_moves
+    depth, deepen = job["depth"], job["deepen"]
+    new_analyzed = 0
+    try:
+        # Games are independent, so analysis shards across processes. Both paths want
+        # this: a plain sync ran single-process, so a handful of new games at a deep
+        # setting took minutes per game. Tunable via COACH_ANALYZE_WORKERS; default =
+        # half the cores, leaving UI headroom.
+        workers = max(1, int(os.environ.get(
+            "COACH_ANALYZE_WORKERS", (os.cpu_count() or 2) // 2)))
+        analyze_cmd = [sys.executable, "-m", "coach.analyze",
+                       "--username", user, "--depth", str(depth),
+                       "--workers", str(workers)]
+        if deepen:
+            # Deepen existing games only — no fetch. Re-analyzes anything below `depth`.
+            phases = (
+                (f"Re-analyzing games below depth {depth} ({workers} workers)…",
+                 analyze_cmd + ["--deepen"]),
+            )
+        else:
+            phases = (
+                ("Fetching recent games…",
+                 [sys.executable, "-m", "coach.fetch_games", user, "--months", "2"]),
+                (f"Analyzing new games (depth {depth}, {workers} workers)…",
+                 analyze_cmd),
+            )
+        # Always refresh the before/after progress report after (re)analysis.
+        phases = (*phases, ("Updating progress report…",
+                            [sys.executable, "-m", "coach.progress"]))
+        for label, cmd in phases:
+            _sync_emit(job, {"t": label})
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=str(ROOT), stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            job["proc"] = proc
+            async for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip()
+                if not line:
+                    continue
+                m = re.search(r"Analyzed (\d+) game", line)
+                if m:
+                    # Sum across shard workers (each prints its own count); a plain
+                    # sequential run prints exactly one such line, so this still works.
+                    new_analyzed += int(m.group(1))
+                _sync_emit(job, {"t": line})
+            await proc.wait()
+        rows = _index_rows()
+        rap = [r for r in rows if r.get("time_class") == "rapid" and r.get("my_rating")]
+        cur = rap[-1]["my_rating"] if rap else None
+        _sync_emit(job, {"done": {"new_analyzed": new_analyzed, "deepen": deepen,
+                                  "games_total": len(rows), "current_rating": cur}})
+    except Exception as e:  # noqa: BLE001
+        _sync_emit(job, {"error": str(e)})
+    finally:
+        job["proc"] = None
+        job["finished"] = time.time()
+        job["running"] = False
+        _sync_emit(job, {"end": True})     # unblocks viewers waiting on the next line
+        # A deepen run rewrites files without changing their count, so the count-keyed
+        # caches would go stale — force a rebuild next read.
+        _games_cache["count"] = _drill_cache["count"] = _ana_cache["count"] = -1
+        # Newly-fetched PGNs mean new games to review; drop the once-built move cache
+        # so /api/game/<id> serves their moves instead of an empty list.
+        _pgn_moves = None
 
 
 @app.post("/api/sync")
 async def api_sync(req: Request):
-    global _sync_running
-    if _sync_running:
-        return JSONResponse({"error": "busy"}, status_code=409)
+    global _sync_job
     user = _config()["username"] or guess_username()
     if not user:
         return JSONResponse({"error": "no_username"}, status_code=400)
@@ -1078,67 +1173,58 @@ async def api_sync(req: Request):
         body = await req.json()
     except Exception:  # noqa: BLE001
         body = {}
-    depth = max(6, min(30, int(body.get("depth") or 12)))    # clamp to a sane range
-    deepen = bool(body.get("deepen"))
+    # Claim the slot synchronously from here down: with no await between the test and the
+    # assignment the event loop can't interleave a second click into the gap.
+    if _sync_job and _sync_job["running"]:
+        return JSONResponse({"error": "busy", **_sync_state(_sync_job)}, status_code=409)
+    job = {
+        "id": f"{int(time.time() * 1000):x}",
+        "running": True, "started": time.time(), "finished": None,
+        "depth": max(6, min(30, int(body.get("depth") or 12))),   # clamp to sane range
+        "deepen": bool(body.get("deepen")),
+        "log": [], "base": 0, "wake": asyncio.Event(), "proc": None, "task": None,
+    }
+    _sync_job = job
+    # Detached on purpose: the job must outlive whoever asked for it.
+    job["task"] = asyncio.create_task(_sync_run(job, user))
+    return _sync_state(job)
+
+
+@app.get("/api/sync/status")
+def api_sync_status():
+    """Cheap poll so a freshly-loaded page knows whether to re-attach."""
+    return _sync_state(_sync_job)
+
+
+@app.get("/api/sync/stream")
+async def api_sync_stream():
+    """Replay the current job's log, then follow it live. Re-attachable, and safe to
+    have open from several tabs at once — a viewer never mutates the job."""
+    job = _sync_job
+    if not job or (not job["running"] and
+                   time.time() - job["finished"] > _SYNC_KEEP):
+        return JSONResponse({"error": "no_job"}, status_code=404)
 
     async def gen():
-        global _sync_running, _pgn_moves
-        _sync_running = True
-        new_analyzed = 0
-        try:
-            workers = max(1, int(os.environ.get(
-                "COACH_ANALYZE_WORKERS", (os.cpu_count() or 2) // 2)))
-            analyze_cmd = [sys.executable, "-m", "coach.analyze",
-                           "--username", user, "--depth", str(depth),
-                           "--workers", str(workers)]
-            if deepen:
-                # Deepen existing games only — no fetch. Re-analyzes anything below `depth`.
-                phases = (
-                    (f"Re-analyzing games below depth {depth} ({workers} workers)…",
-                     analyze_cmd + ["--deepen"]),
-                )
-            else:
-                phases = (
-                    ("Fetching recent games…",
-                     [sys.executable, "-m", "coach.fetch_games", user, "--months", "2"]),
-                    (f"Analyzing new games (depth {depth}, {workers} workers)…",
-                     analyze_cmd),
-                )
-            # Always refresh the before/after progress report after (re)analysis.
-            phases = (*phases, ("Updating progress report…",
-                                [sys.executable, "-m", "coach.progress"]))
-            for label, cmd in phases:
-                yield f"data: {json.dumps({'t': label})}\n\n"
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, cwd=str(ROOT), stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT)
-                async for raw in proc.stdout:
-                    line = raw.decode("utf-8", "replace").rstrip()
-                    if not line:
-                        continue
-                    m = re.search(r"Analyzed (\d+) game", line)
-                    if m:
-                        # Sum across shard workers (each prints its own count); a plain
-                        # sequential run prints exactly one such line, so this still works.
-                        new_analyzed += int(m.group(1))
-                    yield f"data: {json.dumps({'t': line})}\n\n"
-                await proc.wait()
-            rows = _index_rows()
-            rap = [r for r in rows if r.get("time_class") == "rapid" and r.get("my_rating")]
-            cur = rap[-1]["my_rating"] if rap else None
-            yield ("data: " + json.dumps({"done": {
-                "new_analyzed": new_analyzed, "games_total": len(rows),
-                "current_rating": cur}}) + "\n\n")
-        except Exception as e:  # noqa: BLE001
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        finally:
-            _sync_running = False
-            # A deepen run rewrites files without changing their count, so the
-            # count-keyed caches would go stale — force a rebuild next read.
-            _games_cache["count"] = _drill_cache["count"] = _ana_cache["count"] = -1
-            # Newly-fetched PGNs mean new games to review; drop the once-built move
-            # cache so /api/game/<id> serves their moves instead of an empty list.
-            _pgn_moves = None
+        i = job["base"]     # absolute index: the log's head gets trimmed under us
+        while True:
+            wake = job["wake"]          # grab before draining, so no wakeup is missed
+            while True:
+                # Re-clamp every pass: a yield gives the job room to emit (and trim), so
+                # a viewer that falls behind the cap must skip to whatever still exists
+                # rather than index off the front of the list.
+                i = max(i, job["base"])
+                if i >= job["base"] + len(job["log"]):
+                    break
+                ev = job["log"][i - job["base"]]
+                i += 1
+                if ev.get("end"):
+                    yield "data: [DONE]\n\n"
+                    return
+                yield f"data: {json.dumps(ev)}\n\n"
+            if not job["running"]:
+                break
+            await wake.wait()
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
